@@ -26,6 +26,8 @@ int simulation_count = 0;
 // BTB and PT arrays
 BTBEntry btb[BTB_SIZE];
 PTEntry pt[PT_SIZE];
+ReorderBuffer rob;
+ReservationStation rs;
 
 // maping from opcode to string
 char *instructions[] = {"mul", "add", "sub", "div", "ld", "st", "mull", "addl", "subl", "divl", "ldl", "stl", "set", "bez", "bgez", "blez", "bgtz", "bltz", "ret"};
@@ -323,12 +325,24 @@ int *create_memory(int size)
 
 // =================== STAGES ======================================
 
+void retire_stage(CPU *cpu)
+{
+    if (cpu->retire_1.occupied){
+        cpu->regs[rob.entries[cpu->retire_1.dest_value].destinationReg].value = rob.entries[cpu->retire_1.dest_value].result;
+        cpu->regs[rob.entries[cpu->retire_1.dest_value].destinationReg].tag = -1;
+        cpu->regs[rob.entries[cpu->retire_1.dest_value].destinationReg].status = TRUE; 
+        rob.entries[cpu->retire_1.dest_value].destinationReg = -1;
+        rob.entries[cpu->retire_1.dest_value].result = -1;
+        rob.entries[cpu->retire_1.dest_value].completed = FALSE;
+    }
+}
+
 // Writeback Stage
 static int writeback_stage(CPU *cpu)
 {
-    if (cpu->writeback.occupied)
+    if (cpu->writeback_1.occupied)
     {
-        Instruction *inst = cpu->writeback.inst;
+        Instruction *inst = cpu->writeback_1.inst;
         simulation_count += 1;
         switch (inst->opcode)
         {
@@ -343,12 +357,15 @@ static int writeback_stage(CPU *cpu)
             case SET:
             case LD:
             case LDL:
-                cpu->regs[inst->rd].value = cpu->writeback.result;
-                cpu->regs[inst->rd].is_writing = FALSE;
+                rob.entries[cpu->writeback_1.dest_value].result = cpu->writeback_1.result;
+                rob.entries[cpu->writeback_1.dest_value].completed = TRUE;
                 break;
             case RET:
                 return TRUE;
+                break;
         }
+        cpu->retire_1 = cpu->writeback_1;
+        cpu->writeback_1.occupied = FALSE;
     }
     return 0;
 }
@@ -514,11 +531,10 @@ void mul_stage(CPU *cpu)
 // Add Stage
 void add_stage(CPU *cpu)
 {
-    Instruction *inst = cpu->add.inst;
     Stage *s = &cpu->add;
     if (cpu->add.occupied)
     {
-        switch (inst->opcode)
+        switch (s->opcode)
         {
         case ADD:
         case ADDL:
@@ -532,54 +548,14 @@ void add_stage(CPU *cpu)
             s->result = s->src1_value;
             break;
         }
-        switch (inst->opcode)
-        {
-        case ADD:
-        case ADDL:
-        case SUB:
-        case SUBL:
-        case SET:
-            cpu->add_bubble.reg = inst->rd;
-            cpu->add_bubble.val = s->result;
-            cpu->add_bubble.valid = TRUE;
-        }
     }
 }
 
-// fetch values from previous stages execution and memeory
-int bubble_fetch(CPU *cpu, int reg, int *value)
-{
-    if (cpu->regs[reg].is_writing == TRUE)
-    {
-        cpu->halt_flag.halt = TRUE;
-        cpu->halt_flag.reg = reg;
-        return FALSE;
-    }else{
-        cpu->halt_flag.halt = FALSE;
-    }
 
-    if (cpu->add_bubble.valid && cpu->add_bubble.reg == reg)
-    {
-        *value = cpu->add_bubble.val;
-        return TRUE;
-    }else if (cpu->mul_bubble.valid && cpu->mul_bubble.reg == reg)
-    {
-        *value = cpu->mul_bubble.val;
-        return TRUE;
-    }else if (cpu->div_bubble.valid && cpu->div_bubble.reg == reg)
-    {
-        *value = cpu->div_bubble.val;
-        return TRUE;
-    }else if (cpu->memory_bubble.valid && cpu->memory_bubble.reg == reg)
-    {
-        *value = cpu->memory_bubble.val;
-        return TRUE;
-    }else
-    {
-        *value = cpu->regs[reg].value;
-        return TRUE;
-    }
-    return TRUE;
+void issue_stage(CPU *cpu, ReorderBuffer *rbo)
+{
+    Instruction *inst = cpu->read_registers.inst;
+    Stage *s = &cpu->read_registers;
 }
 
 // Read Register Stage
@@ -595,62 +571,46 @@ void read_registers_stage(CPU *cpu)
         case SUBL:
         case MULL:
         case DIVL:
-            if(!bubble_fetch(cpu, inst->rs1, &(cpu->read_registers.src1_value))){
-                break;
-            }
-            if(!bubble_fetch(cpu, inst->rs2, &(cpu->read_registers.src2_value))){
-                break;
-            }
-            if(cpu->halt_flag.end_halt){
-                break;
-            }
-            cpu->regs[cpu->read_registers.dest_value].is_writing = TRUE;
+            s->dest_value = ROB_Enqueue(cpu, s->dest_value);
+            // cpu->decode.dest_value = inst->rd;
+            // cpu->decode.src1_value = inst->rs1;
+            // cpu->decode.src2_value = inst->rs2;
             break;
         case ADD:
         case SUB:
         case MUL:
         case DIV:
-            cpu->read_registers.src2_value = inst->op1;
-            if(!bubble_fetch(cpu, inst->rs1, &(cpu->read_registers.src1_value))){
-                break;
-            }
-            if(cpu->halt_flag.end_halt){
-                break;
-            }
-            cpu->regs[cpu->read_registers.dest_value].is_writing = TRUE;
+            cpu->decode.dest_value = inst->rd;
+            cpu->decode.src1_value = inst->rs1;
+            cpu->decode.src2_value = inst->op1;
             break;
         case LD:
-            cpu->read_registers.src1_value = inst->op1;
-            cpu->regs[cpu->read_registers.dest_value].is_writing = TRUE;
+            cpu->decode.dest_value = inst->rd;
+            cpu->decode.src1_value = inst->op1;
             break;
         case LDL:
-            if(!bubble_fetch(cpu, inst->rs1, &(cpu->read_registers.src1_value))){
-                break;
-            }
-            if(cpu->halt_flag.end_halt){
-                break;
-            }
-            cpu->regs[cpu->read_registers.dest_value].is_writing = TRUE;
+            cpu->decode.dest_value = inst->rd;
+            cpu->decode.src1_value = inst->rs1;
             break;
         case ST:
-            bubble_fetch(cpu, inst->rd, &(cpu->read_registers.src1_value));
+            cpu->decode.dest_value = inst->op1;
+            cpu->decode.src1_value = inst->rd;
             break;
         case STL:
-            if(!bubble_fetch(cpu, inst->rd, &(cpu->read_registers.src1_value))){
-                break;
-            }
-            bubble_fetch(cpu, inst->rs1, &(cpu->read_registers.dest_value));
+            cpu->decode.dest_value = inst->rs1;
+            cpu->decode.src1_value = inst->rd;
             break;
         case SET:
-            cpu->read_registers.src1_value = inst->op1;
-            cpu->regs[cpu->read_registers.dest_value].is_writing = TRUE;
+            s->dest_value = ROB_Enqueue(cpu, s->dest_value);
+            RS_Enqueue(cpu, s->inst->opcode, s->src1_value, s->src2_value, s->dest_value);
             break;
         case BEZ:
         case BGEZ:
         case BLEZ:
         case BGTZ:
         case BLTZ:
-            bubble_fetch(cpu, inst->rd, &(cpu->read_registers.src2_value));
+            cpu->decode.dest_value = inst->rd;
+            cpu->decode.src1_value = inst->op1;
             break;
         }
     }
@@ -742,109 +702,49 @@ void fetch_stage(CPU *cpu)
     }
 }
 
-// end of clock cycle
+
 void end_of_clock_cycle(CPU *cpu)
 {
-    cpu->writeback.occupied = FALSE;
-
-    /* Memory 2 stage  */
-    if (cpu->mem2.occupied && !cpu->writeback.occupied)
-    {
-        cpu->writeback = cpu->mem2;
-        cpu->mem2.occupied = FALSE;
-    }
-
-    /* Memory 1 stage  */
-    if (cpu->mem1.occupied && !cpu->mem2.occupied)
-    {
-        cpu->mem2 = cpu->mem1;
-        cpu->mem1.occupied = FALSE;
-    }
-
-    /* Branch stage  */
-    if (cpu->branch.occupied && !cpu->mem1.occupied)
-    {
-        cpu->mem1 = cpu->branch;
-        cpu->branch.occupied = FALSE;
-    }
-
-    if(!cpu->flush)
-    {
-        /* Div stage */
-        if (!cpu->branch.occupied)
-        {
-            cpu->branch = cpu->div;
-            cpu->div.occupied = FALSE;
-        }
-
-        /* Mul stage  */
-        if (!cpu->div.occupied)
-        {
-            cpu->div = cpu->mul;
-            cpu->mul.occupied = FALSE;
-        }
-
-        /* Add stage  */
-        if (!cpu->mul.occupied)
-        {
-            cpu->mul = cpu->add;
-            cpu->add.occupied = FALSE;
-        }
-
-        if(!cpu->halt_flag.halt && !cpu->halt_flag.end_halt){
-            /* Read Registers stage */
-            if (!cpu->add.occupied)
-            {
-                cpu->add = cpu->read_registers;
-                cpu->read_registers.occupied = FALSE;
+    switch(cpu->issue.opcode){
+        case ADD:
+        case ADDL:
+        case SUB:
+        case SUBL:
+        case SET:
+            if(!cpu->add.occupied){
+                cpu->add = cpu->issue;
+                cpu->issue.occupied = FALSE;
             }
-
-            /* Analyze stage */
-            if (!cpu->read_registers.occupied)
-            {
-                cpu->read_registers = cpu->analyze;
-                cpu->analyze.occupied = FALSE;
-            }
-
-            /* Decode stage */
-            if (!cpu->analyze.occupied)
-            {
-                cpu->analyze = cpu->decode;
-                cpu->decode.occupied = FALSE;
-            }
-
-            /* Fetch stage */
-            if (cpu->fetch.occupied && !cpu->decode.occupied)
-            {
-                cpu->decode = cpu->fetch;
-                cpu->fetch.occupied = FALSE;
-            }
-        }else{
-            cpu->stalled_cycles++;
-        }
-    }else{
-        cpu->flush = FALSE;
     }
 
-    if(!cpu->halt_flag.halt){
-        if(cpu->halt_flag.end_halt){
-            cpu->halt_flag.end_halt = FALSE;
-        }
-    }else{
-        if(!cpu->halt_flag.end_halt){
-            cpu->halt_flag.end_halt = TRUE;
-        }
+    /* Read Registers stage */
+    if (!cpu->issue.occupied)
+    {
+        get_RS(cpu);
+        cpu->read_registers.occupied = FALSE;
     }
 
-    // reset the bubble
-    cpu->add_bubble.valid = FALSE;
-    cpu->mul_bubble.valid = FALSE;
-    cpu->div_bubble.valid = FALSE;
-    cpu->memory_bubble.valid = FALSE;
-    
-    cpu->flush = FALSE;
+    /* Analyze stage */
+    if (!cpu->read_registers.occupied)
+    {
+        cpu->read_registers = cpu->analyze;
+        cpu->analyze.occupied = FALSE;
+    }
+
+    /* Decode stage */
+    if (!cpu->analyze.occupied)
+    {
+        cpu->analyze = cpu->decode;
+        cpu->decode.occupied = FALSE;
+    }
+
+    /* Fetch stage */
+    if (cpu->fetch.occupied && !cpu->decode.occupied)
+    {
+        cpu->decode = cpu->fetch;
+        cpu->fetch.occupied = FALSE;
+    }
 }
-
 // ============================ OUTPUT =============================
 
 void print_output(char *filename, char *output)
@@ -879,13 +779,15 @@ void print_instruction_info(CPU *cpu, int cycle)
     printf("======================================================\n");
     printf("Clock Cycle #: %d\n", cycle + 1);
     printf("-------------------------------------------------------\n");
-    print_instruction("WB  ", cpu->writeback);
+    print_instruction("RS  ", cpu->retire_1);
+    print_instruction("WB  ", cpu->writeback_1);
     print_instruction("MEM2", cpu->mem2);
     print_instruction("MEM1", cpu->mem1);
     print_instruction("BR  ", cpu->branch);
     print_instruction("DIV ", cpu->div);
     print_instruction("MUL ", cpu->mul);
     print_instruction("ADD ", cpu->add);
+    print_instruction("IS  ", cpu->issue);
     print_instruction("RR  ", cpu->read_registers);
     print_instruction("IA  ", cpu->analyze);
     print_instruction("ID  ", cpu->decode);
@@ -966,6 +868,240 @@ int load_memory_map(char *filename, CPU *cpu)
     return num_values;
 }
 
+/*
+ *  CPU simulation loop
+ */
+int CPU_run(CPU *cpu, char *filename)
+{
+    // Initialize program counter (PC)
+    int pc = 0;
+    // Initialize cycle counter
+    int cycle_count = 0;
+    // Initialize stall counter
+    int stall_count = 0;
+    // Initialize instruction counter
+    int instruction_count = 0;
+
+    RS_Init();
+    ROB_Init();
+
+    // initialize parser
+    initilize_parser();
+
+    // Initialize branch predictor
+    initBranchPredictor();
+
+    // allocate memory for data_mem (memory_map)
+    memset(cpu->data_mem, 0, sizeof(int) * MEMORY_SIZE);
+
+    // load memory map file to data_mem array
+    int num_values = load_memory_map("memory_map.txt", cpu);
+
+    // program counter
+    cpu->pc = 0;
+
+    // flush
+    cpu->flush = 0;
+
+    // code memory with instructions
+    cpu->code_mem = load_instructions(filename, &instruction_count);
+
+    // code size (instructions count)
+    cpu->code_size = instruction_count;
+
+    int PAUSE = FALSE;
+    cpu->halt_flag.halt = FALSE;
+
+    while(!PAUSE)
+    {
+        retire_stage(cpu);
+        writeback_stage(cpu);
+        add_stage(cpu);
+        read_registers_stage(cpu);
+        analyze_stage(cpu);
+        decode_stage(cpu);
+        fetch_stage(cpu);
+        print_instruction_info(cpu, cpu->clockCycle);
+        end_of_clock_cycle(cpu);
+
+        printf("\n Register Values \n");
+        for(int i=0;i<REG_COUNT;i++){
+            printf("R%d: [%d, %d, %d]\n", i, cpu->regs[i].status, cpu->regs[i].tag, cpu->regs[i].value);
+        }
+        printf("\n Reorder Buffer \n");
+        for(int i=0;i<ARRLEN(rob.entries);i++){
+            printf("R0B%d: [dest: %d, result: %d, e: %d, completed: %d]\n", i, rob.entries[i].destinationReg, rob.entries[i].result, rob.entries[i].exception, rob.entries[i].completed);
+        }
+        printf("=================\n\n");
+        cpu->clockCycle++;
+
+    }
+
+    // loop through stages
+    // while (!PAUSE)
+    // {
+    //     if (writeback_stage(cpu))
+    //     {
+    //         PAUSE = TRUE;
+    //     }
+    //     memory2_stage(cpu);
+    //     memory1_stage(cpu);
+    //     branch_stage(cpu);
+    //     div_stage(cpu);
+    //     mul_stage(cpu);
+    //     add_stage(cpu);
+    //     read_registers_stage(cpu);
+    //     analyze_stage(cpu);
+    //     decode_stage(cpu);
+    //     fetch_stage(cpu);
+    //     // print_instruction_info(cpu, cpu->clockCycle);
+    //     end_of_clock_cycle(cpu);
+    //     // incrementclock cycle
+    //     cpu->clockCycle++;
+    //     print_display(cpu,cpu->clockCycle);
+    // }
+
+    // write memeory map to text file
+    // input: filename.txt output: filename_output.txt
+    // output filename
+    // char* output_filename = (char*) malloc(strlen(filename) + 11);
+    // char *fle = strrchr(filename, '/');
+    // if(fle != NULL){
+    //     fle++;
+    //     strcpy(filename, fle);
+    // }
+    // sprintf(output_filename, "mmap_%s", filename);
+    // FILE *fpp = fopen(output_filename, "w+");
+    // if(fpp == NULL){
+    //     printf("Error: could not open file \n");
+    //     return 1;
+    // }
+    // for (int i = 0; i < num_values; i++) {
+    //     fprintf(fpp, "%d ", cpu->data_mem[i]); // write each element of the array to the file
+    // }
+    // fclose(fpp);
+    // free(output_filename);
+
+    // simulation output
+    print_registers(cpu);
+    printf("Stalled cycles due to data hazard: %d\n", cpu->stalled_cycles);
+    printf("Total execution cycles: %d\n", cpu->clockCycle);
+    printf("Total instruction simulated: %d\n", simulation_count);
+    printf("IPC: %f\n", (float)simulation_count / cpu->clockCycle);
+
+    return 0;
+}
+
+// create registers
+Register *
+create_registers(int size)
+{
+    Register *regs = malloc(sizeof(*regs) * size);
+    if (!regs)
+    {
+        return NULL;
+    }
+    for (int i = 0; i < size; i++)
+    {
+        regs[i].status = 0;
+        regs[i].tag = 0;
+        regs[i].value = 0;
+    }
+    return regs;
+}
+
+// ROB initialization
+void ROB_Init() {
+    rob.head = rob.tail = 0;
+    for (int i = 0; i < ROB_SIZE; i++) {
+        rob.entries[i].completed = TRUE;
+        rob.entries[i].exception = FALSE;
+        rob.entries[i].result = -1;
+        rob.entries[i].destinationReg = -1;
+        rob.entries[i].ROBid = i;
+    }
+}
+
+// check if rob is full
+bool ROB_IsFull() {
+    return (rob.tail + 1) % ROB_SIZE == rob.head;
+}
+
+// check if rob is empty
+bool ROB_IsEmpty() {
+    return rob.head == rob.tail;
+}
+
+// add entry to rob
+int ROB_Enqueue(CPU *cpu, int destReg) {
+    if (ROB_IsFull(rob)) {
+        return -1;  // ROB is full
+    }
+    int ROBid = rob.tail;
+    cpu->regs[destReg].tag = ROBid;
+    rob.tail = (rob.tail + 1) % ROB_SIZE;
+    rob.entries[ROBid].ROBid = ROBid;
+    rob.entries[ROBid].destinationReg = destReg;
+    rob.entries[ROBid].completed = FALSE;
+    return ROBid;
+}
+
+// update rob result
+void ROB_Update(int ROBid, int result) {
+    rob.entries[ROBid].result = result;
+}
+
+// commit rob
+void ROB_Commit(int ROBid) {
+    rob.entries[ROBid].completed = false;
+}
+
+// check if rob is ready
+bool ROB_IsReady(int ROBid) {
+    return rob.entries[ROBid].completed && !rob.entries[ROBid].exception;
+}
+
+void RS_Init() {
+    rs.head = rs.tail = 0;
+    for (int i = 0; i < RS_SIZE; i++) {
+        rs.entries[i].valid = false;
+        rs.entries[i].src1_ready = rs.entries[i].src2_ready = false;
+    }
+}
+
+bool RS_IsFull() {
+    return (rs.tail + 1) % RS_SIZE == rs.head;
+}
+
+bool RS_IsEmpty() {
+    return rs.head == rs.tail;
+}
+
+int RS_Enqueue(CPU *cpu, int opcode, int operand1, int operand2, int destReg) {
+    if (RS_IsFull()) {
+        return -1;  // RS is full
+    }
+    int RSEntryId = rs.tail;
+    rs.tail = (rs.tail + 1) % RS_SIZE;
+    rs.entries[RSEntryId] = cpu->read_registers;
+    rs.entries[RSEntryId].opcode = cpu->read_registers.inst->opcode;
+    rs.entries[RSEntryId].valid = true;
+    rs.entries[RSEntryId].src1_ready = rs.entries[RSEntryId].src2_ready = false;
+    return RSEntryId;
+}
+
+bool RS_IsReady(int RSEntryId) {
+    return rs.entries[RSEntryId].valid && rs.entries[RSEntryId].src1_ready && rs.entries[RSEntryId].src2_ready;
+}
+
+void RS_Clear(int RSEntryId) {
+    rs.entries[RSEntryId].valid = false;
+}
+
+void get_RS(CPU *cpu){
+    int RSEntryId = rs.tail-1;
+    cpu->issue = rs.entries[RSEntryId];
+}
 
 // Initialize BTB and PT
 void initBranchPredictor() {
@@ -1034,122 +1170,3 @@ int predictBranchOutcome(int pc) {
     }
 }
 
-/*
- *  CPU simulation loop
- */
-int CPU_run(CPU *cpu, char *filename)
-{
-    // print_display(cpu,0);
-
-    // Initialize program counter (PC)
-    int pc = 0;
-    // Initialize cycle counter
-    int cycle_count = 0;
-    // Initialize stall counter
-    int stall_count = 0;
-    // Initialize instruction counter
-    int instruction_count = 0;
-
-    // initialize parser
-    initilize_parser();
-
-    // Initialize branch predictor
-    initBranchPredictor();
-
-    // allocate memory for data_mem (memory_map)
-    memset(cpu->data_mem, 0, sizeof(int) * MEMORY_SIZE);
-
-    // load memory map file to data_mem array
-    int num_values = load_memory_map("memory_map.txt", cpu);
-
-    // program counter
-    cpu->pc = 0;
-
-    cpu->flush = 0;
-
-    // code memory with instructions
-    cpu->code_mem = load_instructions(filename, &instruction_count);
-
-    // code size (instructions count)
-    cpu->code_size = instruction_count;
-
-    int PAUSE = FALSE;
-    // cpu->halt_flag = FALSE;
-    cpu->halt_flag.halt = FALSE;
-
-    // loop through stages
-    while (!PAUSE)
-    {
-        if (writeback_stage(cpu))
-        {
-            PAUSE = TRUE;
-        }
-        memory2_stage(cpu);
-        memory1_stage(cpu);
-        branch_stage(cpu);
-        div_stage(cpu);
-        mul_stage(cpu);
-        add_stage(cpu);
-        read_registers_stage(cpu);
-        analyze_stage(cpu);
-        decode_stage(cpu);
-        fetch_stage(cpu);
-        // print_instruction_info(cpu, cpu->clockCycle);
-        end_of_clock_cycle(cpu);
-
-        // increment clock cycle
-        cpu->clockCycle++;
-
-        print_display(cpu,cpu->clockCycle);
-    }
-
-    // write memeory map to text file
-    // input: filename.txt output: filename_output.txt
-    // output filename
-    char* output_filename = (char*) malloc(strlen(filename) + 11);
-    char *fle = strrchr(filename, '/');
-    if(fle != NULL){
-        fle++;
-        strcpy(filename, fle);
-    }
-
-    sprintf(output_filename, "mmap_%s", filename);
-
-    FILE *fpp = fopen(output_filename, "w+");
-    if(fpp == NULL){
-        printf("Error: could not open file \n");
-        return 1;
-    }
-    for (int i = 0; i < num_values; i++) {
-        fprintf(fpp, "%d ", cpu->data_mem[i]); // write each element of the array to the file
-    }
-    fclose(fpp);
-
-    free(output_filename);
-
-    // simulation output
-    print_registers(cpu);
-    printf("Stalled cycles due to data hazard: %d\n", cpu->stalled_cycles);
-    printf("Total execution cycles: %d\n", cpu->clockCycle);
-    printf("Total instruction simulated: %d\n", simulation_count);
-    printf("IPC: %f\n", (float)simulation_count / cpu->clockCycle);
-
-    return 0;
-}
-
-// create registers
-Register *
-create_registers(int size)
-{
-    Register *regs = malloc(sizeof(*regs) * size);
-    if (!regs)
-    {
-        return NULL;
-    }
-    for (int i = 0; i < size; i++)
-    {
-        regs[i].value = 0;
-        regs[i].is_writing = FALSE;
-    }
-    return regs;
-}
